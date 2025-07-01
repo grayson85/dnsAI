@@ -1,0 +1,342 @@
+-- Listen on 0.0.0.0:53 to capture all traffic
+setLocal("0.0.0.0:53")
+
+-- Backend: BIND at 127.0.0.1:5300
+newServer({address="127.0.0.1:5300", checkDNSSECSignatures=false})
+
+-- Allow all clients
+setACL({"0.0.0.0/0", "::/0"})
+
+-- Enable packet cache for performance
+-- pc = newPacketCache(100000, 86400, 0, 60, 60)
+-- getPool(""):setCache(pc)
+
+-- Increase UDP capacity to handle high query rates
+setMaxUDPOutstanding(65535)
+
+-- Whitelist config (for logging legitimate traffic)
+whitelistedIPs = newNMG()
+whitelistedIPs:addMask("192.168.123.123/32")
+
+whitelistedDomains = {
+  ["www.google.com"] = true,
+  ["mail.google.com"] = true,
+  ["dns.example.com"] = true
+}
+
+-- Stats window size (seconds)
+windowSize = 60
+ipStats = {}
+refusedSubdomains = {}
+queryCounter = 0
+logDir = "/opt/dnsai/logs/"
+
+function getDatedLogFile(baseName)
+  return logDir .. baseName .. os.date("%Y%m%d") .. ".csv"
+end
+
+-- Utility: Check if file exists and is empty
+function fileExistsAndEmpty(path)
+  local f = io.open(path, "r")
+  if not f then return true end
+  local size = f:seek("end")
+  f:close()
+  return size == 0
+end
+
+-- Rcode mapping
+local rcode_map = {
+  [0]  = "NOERROR",
+  [1]  = "FORMERR",
+  [2]  = "SERVFAIL",
+  [3]  = "NXDOMAIN",
+  [5]  = "REFUSED"
+}
+
+-- Utility: Entropy calculator
+function calculateEntropy(s)
+  if not s or #s == 0 then return 0.0 end
+  local counts = {}
+  for i = 1, #s do
+    local c = s:sub(i,i)
+    counts[c] = (counts[c] or 0) + 1
+  end
+  local entropy = 0
+  for _, count in pairs(counts) do
+    local p = count / #s
+    entropy = entropy - p * math.log(p) / math.log(2)
+  end
+  return entropy
+end
+
+-- Extract subdomain
+function extractSubdomain(qname)
+  local labels = {}
+  for label in string.gmatch(qname, "([^.]+)") do
+    table.insert(labels, label)
+  end
+  if #labels <= 2 then return "" end
+  return table.concat(labels, ".", 1, #labels - 2)
+end
+
+function calculateSubdomainEntropy(qname)
+  return calculateEntropy(extractSubdomain(qname))
+end
+
+-- Calculate case randomness
+function calculateCaseRandomness(str)
+  if not str or #str <= 1 then return 0.0 end
+  local transitions = 0
+  local prevIsUpper = nil
+  for i = 1, #str do
+    local c = str:sub(i,i)
+    local isUpper = c:match("[A-Z]") ~= nil
+    if prevIsUpper ~= nil and isUpper ~= prevIsUpper then
+      transitions = transitions + 1
+    end
+    prevIsUpper = isUpper
+  end
+  return transitions / math.max(#str - 1, 1)
+end
+
+-- Simplified Levenshtein distance for subdomain clustering
+function levenshteinDistance(s1, s2)
+  local len1, len2 = #s1, #s2
+  if len1 == 0 then return len2 end
+  if len2 == 0 then return len1 end
+  local matrix = {}
+  for i = 0, len1 do
+    matrix[i] = {[0] = i}
+  end
+  for j = 0, len2 do
+    matrix[0][j] = j
+  end
+  for i = 1, len1 do
+    for j = 1, len2 do
+      local cost = s1:sub(i,i) == s2:sub(j,j) and 0 or 1
+      matrix[i][j] = math.min(
+        matrix[i-1][j] + 1,
+        matrix[i][j-1] + 1,
+        matrix[i-1][j-1] + cost
+      )
+    end
+  end
+  return matrix[len1][len2]
+end
+
+-- Compute subdomain cluster score
+function computeSubdomainClusterScore(subdomain)
+  if not refusedSubdomains or #refusedSubdomains == 0 then return 0.0 end
+  local distances = {}
+  local refusedCount = 0
+  for s in pairs(refusedSubdomains) do
+    local dist = levenshteinDistance(subdomain, s)
+    if dist < 5 then
+      refusedCount = refusedCount + 1
+      table.insert(distances, dist)
+    end
+  end
+  if #distances == 0 then return 0.0 end
+  local avgDistance = 0
+  for _, dist in ipairs(distances) do
+    avgDistance = avgDistance + dist
+  end
+  avgDistance = avgDistance / #distances
+  return refusedCount / math.max(1, #refusedSubdomains) * (avgDistance < 5 and 1 or 0)
+end
+
+-- Purge old stats to prevent memory growth
+function purgeOldStats(now)
+  local purged = 0
+  for ip, stats in pairs(ipStats) do
+    local newWindow = {}
+    for _, entry in ipairs(stats.queries or {}) do
+      if entry and type(entry) == "table" and now - (entry.time or 0) < windowSize then
+        table.insert(newWindow, entry)
+      else
+        purged = purged + 1
+      end
+    end
+    if #newWindow == 0 then
+      ipStats[ip] = nil
+    elseif #newWindow > 5000 then
+      ipStats[ip].queries = {table.unpack(newWindow, #newWindow - 4999, #newWindow)}
+      print(string.format("[DEBUG] Capped ipStats for %s to 5000 entries", ip))
+    else
+      ipStats[ip].queries = newWindow
+    end
+  end
+
+  local subdomainCount = 0
+  for _ in pairs(refusedSubdomains) do subdomainCount = subdomainCount + 1 end
+  if subdomainCount > 10000 then
+    refusedSubdomains = {}
+    print("[DEBUG] Cleared refusedSubdomains to prevent memory growth")
+  end
+  if purged > 0 then
+    print(string.format("[DEBUG] Purged %d old stats", purged))
+  end
+end
+
+-- Log query and IP features to CSV
+function logFeatures(qname, clientIP, qtype, rcode, entropy, sub_entropy, qname_length, case_randomness, stats, now, query_id)
+  if not stats or type(stats) ~= "table" or not stats.queries then
+    print(string.format("[ERROR] Invalid stats table for clientIP %s, query_id %s", clientIP, query_id))
+    stats = { queries = {} }
+  end
+  local total = #stats.queries
+  local nxd, servfail, refused, reverse_dns = 0, 0, 0, 0
+  local sum_entropy, sum_sub_entropy = 0, 0
+  local domain_set = {}
+  local repeated_query_count = 0
+  local subdomain = extractSubdomain(qname) or qname
+  if rcode == 2 or rcode == 5 then
+    refusedSubdomains[subdomain] = true
+  end
+  for i, entry in ipairs(stats.queries) do
+    if not entry or type(entry) ~= "table" or not entry.qname then
+      print(string.format("[DEBUG] Skipping invalid query entry %d for clientIP %s, query_id %s", i, clientIP, query_id))
+    else
+      if entry.qname == qname then repeated_query_count = repeated_query_count + 1 end
+      if entry.rcode == 3 then nxd = nxd + 1 end
+      if entry.rcode == 2 then servfail = servfail + 1 end
+      if entry.rcode == 5 then refused = refused + 1 end
+      if entry.qname:match("%.in%-addr%.arpa$") or entry.qname:match("%.ip6%.arpa$") then reverse_dns = reverse_dns + 1 end
+      sum_entropy = sum_entropy + (entry.entropy or 0)
+      sum_sub_entropy = sum_sub_entropy + (entry.sub_entropy or 0)
+      domain_set[entry.qname] = true
+    end
+  end
+  local avg_entropy = total > 0 and sum_entropy / total or 0
+  local avg_sub_entropy = total > 0 and sum_sub_entropy / total or 0
+
+  local nxd_ratio = total > 0 and nxd / total or 0
+  local servfail_ratio = total > 0 and servfail / total or 0
+  local refused_ratio = total > 0 and refused / total or 0
+  local reverse_dns_ratio = total > 0 and reverse_dns / total or 0
+  local legit_query_ratio = total > 0 and (total - nxd - servfail - refused) / total or 0
+  local unique_domains = 0
+  for _ in pairs(domain_set) do unique_domains = unique_domains + 1 end
+  local query_rate = total / windowSize
+  local query_burst = total > 50 and windowSize < 10 and 1 or 0
+  local is_reverse_dns = qname:match("%.in%-addr%.arpa$") or qname:match("%.ip6%.arpa$") and 1 or 0
+  local legit_query_ratio_query = rcode == 0 and 1.0 or 0.0
+  local subdomain_length = #subdomain
+  local subdomain_cluster_score = computeSubdomainClusterScore(subdomain)
+  local queryFile = getDatedLogFile("dns_query_features_")
+  local queryHeader = "timestamp,client_ip,qname,qname_length,qtype,entropy,subdomain_entropy,rcode,query_id,subdomain_length,case_randomness,subdomain_cluster_score,is_reverse_dns,legit_query_ratio\n"
+  local query_log = string.format("%d,%s,%s,%d,%d,%.4f,%.4f,%s,%s,%d,%.4f,%.4f,%d,%.4f\n",
+    now, clientIP, qname, qname_length, qtype, entropy, sub_entropy,
+    rcode_map[rcode] or tostring(rcode), query_id, subdomain_length, case_randomness,
+    subdomain_cluster_score, is_reverse_dns, legit_query_ratio_query)
+  local file = io.open(queryFile, "a")
+  if file then
+    if fileExistsAndEmpty(queryFile) then
+      file:write(queryHeader)
+    end
+    file:write(query_log)
+    file:close()
+    print("[DEBUG] Wrote query log: " .. query_log)
+  else
+    print(string.format("[ERROR] Failed to open query file %s: check permissions or disk space", queryFile))
+  end
+  local ipFile = getDatedLogFile("dns_ip_features_")
+  local ipHeader = "query_id,client_ip,total_queries,unique_domains,avg_entropy,avg_subdomain_entropy,nxdomain_ratio,servfail_ratio,refused_ratio,query_rate,repeated_query_count,query_burst,reverse_dns_ratio,legit_query_ratio\n"
+  local ip_log = string.format("%s,%s,%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%d,%.4f,%.4f\n",
+      query_id, clientIP, total, unique_domains, avg_entropy, avg_sub_entropy,
+      nxd_ratio, servfail_ratio, refused_ratio, query_rate, repeated_query_count,
+      query_burst, reverse_dns_ratio, legit_query_ratio)
+  file = io.open(ipFile, "a")
+  if file then
+    if fileExistsAndEmpty(ipFile) then
+      file:write(ipHeader)
+    end
+    file:write(ip_log)
+    file:close()
+    print("[DEBUG] Wrote IP log: " .. ip_log)
+  else
+    print(string.format("[ERROR] Failed to open IP file %s: check permissions or disk space", ipFile))
+  end
+end
+
+-- Query handler (stores queries for stats but does not log to CSV)
+function queryHandler(dq)
+  if not dq then
+    print("[ERROR] Invalid DNSQuestion object")
+    return DNSAction.None, ""
+  end
+  local qname = dq.qname:toString():gsub("%.$", ""):lower()
+  local clientIP = dq.remoteaddr:toString()
+  local qtype = dq.qtype
+  local now = os.time()
+  queryCounter = queryCounter + 1
+  local query_id = tostring(now) .. "_" .. tostring(queryCounter) .. "_" .. clientIP .. "_" .. qname
+  purgeOldStats(now)
+  local entropy = calculateEntropy(qname)
+  local sub_entropy = calculateSubdomainEntropy(qname)
+  local qname_length = #qname
+  local case_randomness = calculateCaseRandomness(qname)
+  ipStats[clientIP] = ipStats[clientIP] or { queries = {} }
+  table.insert(ipStats[clientIP].queries, {
+    query_id = query_id,
+    time = now,
+    qname = qname,
+    rcode = -1,
+    entropy = entropy,
+    sub_entropy = sub_entropy,
+    qtype = qtype,
+    case_randomness = case_randomness,
+    qname_length = qname_length
+  })
+  print(string.format("[DEBUG] Stored query %s %s query_id=%s", clientIP, qname, query_id))
+  return DNSAction.None, ""
+end
+
+-- Response handler (logs queries and updates stats)
+function responseHandler(dr)
+    if not dr then
+        print("[ERROR] Invalid DNSResponse object")
+        return DNSResponseAction.None, ""
+    end
+    local qname = dr.qname:toString():gsub("%.$", ""):lower()
+    local clientIP = dr.remoteaddr:toString()
+    local qtype = dr.qtype
+    local rcode = dr.rcode
+    local now = os.time()
+    queryCounter = queryCounter + 1
+    local query_id = tostring(now) .. "_" .. tostring(queryCounter) .. "_" .. clientIP .. "_" .. qname
+    local entropy = calculateEntropy(qname)
+    local sub_entropy = calculateSubdomainEntropy(qname)
+    local qname_length = #qname
+    local case_randomness = calculateCaseRandomness(qname)
+    ipStats[clientIP] = ipStats[clientIP] or { queries = {} }
+    local found = false
+    for i, entry in ipairs(ipStats[clientIP].queries) do
+        if entry and type(entry) == "table" and entry.qname == qname and entry.rcode == -1 and entry.time == now then
+            entry.rcode = rcode
+            entry.query_id = query_id
+            found = true
+            break
+        end
+    end
+    if not found then
+        table.insert(ipStats[clientIP].queries, {
+            query_id = query_id,
+            time = now,
+            qname = qname,
+            rcode = rcode,
+            entropy = entropy,
+            sub_entropy = sub_entropy,
+            qtype = qtype,
+            case_randomness = case_randomness,
+            qname_length = qname_length
+        })
+    end
+    logFeatures(qname, clientIP, qtype, rcode, entropy, sub_entropy, qname_length, case_randomness, ipStats[clientIP], now, query_id)
+    print(string.format("[DEBUG] Logged response %s %s query_id=%s rcode=%s", clientIP, qname, query_id, rcode_map[rcode] or tostring(rcode)))
+    return DNSResponseAction.None, ""
+end
+
+-- Register handlers
+addAction(AllRule(), LuaAction(queryHandler))
+addResponseAction(AllRule(), LuaResponseAction(responseHandler))
