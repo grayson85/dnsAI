@@ -116,8 +116,8 @@ class DNSRequestHandler(socketserver.StreamRequestHandler):
                 self.wfile.flush()
                 return
 
-            # Validate query_id format
-            if not re.match(r"\d+_\d+_\d+\.\d+\.\d+\.\d+_.+", query_id):
+            # Validate query_id format (updated to accept timestamp_clientIP_qname or timestamp_index_clientIP_qname)
+            if not re.match(r"\d+_(\d+_)?\d+\.\d+\.\d+\.\d+_.+", query_id):
                 logger.error(f"Invalid query_id format: {query_id}")
                 self.wfile.write(json.dumps({"shouldBlock": False, "modelVersion": "error", "query_id": query_id, "client_ip": client_ip}).encode("utf-8") + b"\n")
                 self.wfile.flush()

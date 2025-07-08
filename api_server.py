@@ -171,8 +171,8 @@ class PredictionHandler(http.server.BaseHTTPRequestHandler):
                     self.wfile.write(json.dumps({"error": "Missing required fields"}).encode("utf-8"))
                     return
 
-                # Validate query_id format
-                if not re.match(r"\d+_\d+_\d+\.\d+\.\d+\.\d+_.+", query_id):
+                # Validate query_id format (updated to accept timestamp_clientIP_qname or timestamp_index_clientIP_qname)
+                if not re.match(r"\d+_(\d+_)?\d+\.\d+\.\d+\.\d+_.+", query_id):
                     logger.error(f"Invalid query_id format: {query_id}")
                     self.send_response(400)
                     self.send_header("Content-Type", "application/json")
@@ -239,8 +239,8 @@ class PredictionHandler(http.server.BaseHTTPRequestHandler):
                     self.wfile.write(json.dumps({"error": "Missing required fields"}).encode("utf-8"))
                     return
 
-                # Validate query_id format
-                if not re.match(r"\d+_\d+_\d+\.\d+\.\d+\.\d+_.+", query_id):
+                # Validate query_id format (updated to accept timestamp_clientIP_qname or timestamp_index_clientIP_qname)
+                if not re.match(r"\d+_(\d+_)?\d+\.\d+\.\d+\.\d+_.+", query_id):
                     logger.error(f"Invalid query_id format: {query_id}")
                     self.send_response(400)
                     self.send_header("Content-Type", "application/json")
